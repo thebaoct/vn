@@ -1,0 +1,2047 @@
+﻿// ============================================================
+// 🚀 BẮT ĐẦU: NÂNG CẤP HỆ THỐNG LƯU TRỮ (IndexedDB WRAPPER)
+// ============================================================
+
+
+const APP_STORAGE_KEYS = [
+    'thebao_store_config', 
+    'thebao_catalog_v6', 
+    'thebao_inventory',
+    'thebao_customers', 
+    'invoiceHistory', 
+    'thebao_debt_list', 
+    'thebao_customer_credit'
+];
+
+
+const MEM_CACHE = {};
+
+
+window.originalLocalStorage = {
+    getItem: window.localStorage.getItem.bind(window.localStorage),
+    setItem: window.localStorage.setItem.bind(window.localStorage),
+    removeItem: window.localStorage.removeItem.bind(window.localStorage)
+};
+
+
+async function initStorageSystem() {
+    console.log("🚀 Đang khởi động hệ thống lưu trữ dung lượng lớn (IndexedDB)...");
+    localforage.config({ name: 'TheBaoTool_DB', storeName: 'app_data_store' });
+
+
+    for (const key of APP_STORAGE_KEYS) {
+        try {
+            let val = await localforage.getItem(key);
+            if (val === null) {
+                const oldVal = window.originalLocalStorage.getItem(key);
+                if (oldVal) {
+                    console.log(`♻️ Đang di chuyển dữ liệu cũ [${key}] sang hệ thống mới...`);
+                    val = oldVal;
+                    await localforage.setItem(key, val); 
+                }
+            }
+            MEM_CACHE[key] = val;
+        } catch (err) {
+            console.error(`Lỗi tải dữ liệu [${key}]:`, err);
+        }
+    }
+    console.log("✅ Đã nạp xong dữ liệu vào bộ nhớ đệm.");
+}
+
+
+Storage.prototype.getItem = function(key) {
+    if (APP_STORAGE_KEYS.includes(key)) {
+        return MEM_CACHE[key] !== undefined ? MEM_CACHE[key] : null;
+    }
+    return window.originalLocalStorage.getItem(key);
+};
+
+
+Storage.prototype.setItem = function(key, value) {
+    if (APP_STORAGE_KEYS.includes(key)) {
+        MEM_CACHE[key] = String(value); 
+        localforage.setItem(key, String(value)).catch(e => console.error("Lỗi lưu DB:", e)); 
+        return;
+    }
+    window.originalLocalStorage.setItem(key, value);
+};
+
+
+Storage.prototype.removeItem = function(key) {
+    if (APP_STORAGE_KEYS.includes(key)) {
+        delete MEM_CACHE[key];
+        localforage.removeItem(key);
+        return;
+    }
+    window.originalLocalStorage.removeItem(key);
+};
+
+
+// ============================================================
+// DATA & CONFIG
+// ============================================================
+const defaultCatalog = [
+    { id: "cat_game", name: "Thẻ Game", products: [ { name: "Garena", prices: [{face: 20000, sell: 20000}, {face: 50000, sell: 50000}, {face: 100000, sell: 100000}] }, { name: "Zing", prices: [{face: 20000, sell: 20000}, {face: 50000, sell: 50000}, {face: 100000, sell: 100000}] } ] },
+    { id: "cat_mobile", name: "Điện Thoại", products: [ { name: "Viettel", prices: [{face: 10000, sell: 10000}, {face: 20000, sell: 20000}, {face: 50000, sell: 50000}] }, { name: "Vina", prices: [{face: 10000, sell: 10000}, {face: 20000, sell: 20000}] } ] },
+    { id: "cat_service", name: "Dịch vụ", products: [ { name: "Phí GD", prices: [] }, { name: "Phí Ship", prices: [] } ] }
+];
+
+
+const defaultStoreConfig = { brandName: "THE BÁO", slogan: "Dịch vụ thẻ cào trực tuyến", hotline: "0354.830.400", bankId: "MB", accNum: "0354830400", accName: "NGUYEN VAN A" };
+
+
+let productCatalog = [], storeConfig = {}, customerList = [], cartItems = [];
+let inventory = {}; 
+let currentPaymentMethod = 'CASH', isPaid = false, isOrderSaved = false, isEditMode = false, isDebtViewMode = false, currentDebtTab = 'active', restoreMode = 'merge';
+let selectedCatIndex = null, selectedProdIndex = null;
+
+
+// --- CORE FUNCTIONS ---
+function init() {
+    loadStoreConfig(); loadCatalog(); loadCustomerList(); loadInventory();
+    const now = new Date();
+    document.getElementById('inpTime').value = now.toTimeString().substring(0,5);
+    
+    const _y = now.getFullYear();
+    const _m = String(now.getMonth() + 1).padStart(2, '0');
+    const _d = String(now.getDate()).padStart(2, '0');
+    document.getElementById('inpDate').value = `${_y}-${_m}-${_d}`;
+
+
+    generateRandomInvoiceID(); renderCatalogSelects(); updateInvoiceHeader(); renderInputFields(); calculateTodayRevenue();
+    
+    document.addEventListener('keydown', function(event) { if (event.key === "Enter" && (document.activeElement.tagName === 'INPUT')) addToCart(); });
+    document.addEventListener('click', function(e) { 
+        if (!e.target.closest('.form-group')) document.querySelectorAll('.suggestion-list').forEach(e => e.style.display = 'none'); 
+        if (!e.target.closest('#smartSearchBox')) document.getElementById('smartSearchResults').style.display='none';
+    });
+    
+    updatePrintSize();
+}
+
+
+function updatePrintSize() {
+    const size = document.getElementById('selPrintSize').value;
+    const box = document.getElementById('invoiceArea');
+    box.classList.remove('size-k80', 'size-k57');
+    box.classList.add('size-' + size);
+}
+
+
+// --- HELPERS ---
+const formatMoney = (val) => { if (!val) return "0"; if (!isNaN(val) && !isNaN(parseFloat(val))) return parseInt(val).toString().replace(/\B(?=(\d{3})+(?!\d))/g, "."); return val; };
+const formatReadableCode = (code) => code ? code.replace(/\s+/g, '').replace(/(.{4})/g, '$1 ').trim() : "";
+
+
+// --- SETTINGS UI ---
+function openSettings() { 
+    document.getElementById('cfgBrandName').value = storeConfig.brandName; 
+    document.getElementById('cfgSlogan').value = storeConfig.slogan; 
+    document.getElementById('cfgHotline').value = storeConfig.hotline; 
+    document.getElementById('cfgBankId').value = storeConfig.bankId; 
+    document.getElementById('cfgAccNum').value = storeConfig.accNum; 
+    document.getElementById('cfgAccName').value = storeConfig.accName; 
+    selectedCatIndex = null; selectedProdIndex = null; 
+    renderCatalogSettings(); renderCustomerTable(); renderInventoryTab();
+    document.getElementById('settingsModal').style.display = 'flex'; 
+}
+
+
+function switchSettingTab(tab, btn) {
+    document.querySelectorAll('#settingsModal .tab-item').forEach(t => t.classList.remove('active'));
+    if(btn) btn.classList.add('active');
+    document.querySelectorAll('#settingsModal .tab-content').forEach(c => c.classList.remove('active'));
+    document.getElementById(`setTab_${tab}`).classList.add('active');
+}
+
+
+function loadStoreConfig() { storeConfig = JSON.parse(localStorage.getItem('thebao_store_config') || JSON.stringify(defaultStoreConfig)); }
+
+
+function saveGlobalSettings() {
+    storeConfig.brandName = document.getElementById('cfgBrandName').value;
+    storeConfig.slogan = document.getElementById('cfgSlogan').value;
+    storeConfig.hotline = document.getElementById('cfgHotline').value;
+    storeConfig.bankId = document.getElementById('cfgBankId').value;
+    storeConfig.accNum = document.getElementById('cfgAccNum').value;
+    storeConfig.accName = document.getElementById('cfgAccName').value;
+    localStorage.setItem('thebao_store_config', JSON.stringify(storeConfig));
+    updateInvoiceHeader(); alert("✅ Đã lưu cấu hình!");
+}
+
+
+// --- CATALOG LOGIC ---
+function loadCatalog() { productCatalog = JSON.parse(localStorage.getItem('thebao_catalog_v6') || JSON.stringify(defaultCatalog)); }
+function saveCatalogSettings() { localStorage.setItem('thebao_catalog_v6', JSON.stringify(productCatalog)); renderCatalogSelects(); alert("✅ Đã lưu sản phẩm!"); }
+
+
+function renderCatalogSettings() {
+    const catList = document.getElementById('catList_categories');
+    catList.innerHTML = productCatalog.map((c, i) => `<div class="cat-item ${selectedCatIndex===i?'active':''}" onclick="selectCategory(${i})"><span>${c.name}</span> <button class="btn-mini btn-danger" onclick="deleteCategory(event, ${i})">x</button></div>`).join('');
+    
+    const prodList = document.getElementById('catList_products');
+    if(selectedCatIndex!==null) prodList.innerHTML = productCatalog[selectedCatIndex].products.map((p,i) => `<div class="cat-item ${selectedProdIndex===i?'active':''}" onclick="selectProduct(${i})"><span>${p.name}</span> <button class="btn-mini btn-danger" onclick="deleteProduct(event, ${i})">x</button></div>`).join('');
+    else prodList.innerHTML = '<div style="text-align:center;color:#999;">Chọn danh mục</div>';
+    
+    const priceList = document.getElementById('catList_prices');
+    if(selectedCatIndex!==null && selectedProdIndex!==null) {
+        priceList.innerHTML = productCatalog[selectedCatIndex].products[selectedProdIndex].prices.map((p,i) => 
+            `<div class="price-input-group"><label>Face:</label><input type="text" value="${p.face}" onchange="updatePriceVal(${i},'face',this.value)"> <label>Bán:</label><input type="number" value="${p.sell}" onchange="updatePriceVal(${i},'sell',this.value)"> <label>Phí:</label><input type="number" value="${p.surcharge||0}" onchange="updatePriceVal(${i},'surcharge',this.value)"> <button class="btn-mini btn-danger" onclick="deletePrice(${i})">x</button></div>`
+        ).join('');
+    } else priceList.innerHTML = '<div style="text-align:center;color:#999;">Chọn sản phẩm</div>';
+}
+
+
+function selectCategory(i) { selectedCatIndex=i; selectedProdIndex=null; renderCatalogSettings(); }
+function selectProduct(i) { selectedProdIndex=i; renderCatalogSettings(); }
+function addCategory() { const n = prompt("Tên danh mục:"); if(n) { productCatalog.push({id:Date.now(), name:n, products:[]}); renderCatalogSettings(); } }
+function deleteCategory(e, i) { e.stopPropagation(); if(confirm("Xóa?")) { productCatalog.splice(i,1); selectedCatIndex=null; renderCatalogSettings(); } }
+function addProduct() { if(selectedCatIndex===null) return; const n = prompt("Tên sản phẩm:"); if(n) { productCatalog[selectedCatIndex].products.push({name:n, products:[]}); renderCatalogSettings(); } }
+function deleteProduct(e, i) { e.stopPropagation(); if(confirm("Xóa?")) { productCatalog[selectedCatIndex].products.splice(i,1); selectedProdIndex=null; renderCatalogSettings(); } }
+function addPrice() { if(selectedProdIndex===null) return; productCatalog[selectedCatIndex].products[selectedProdIndex].prices.push({face:10000, sell:10000}); renderCatalogSettings(); }
+function deletePrice(i) { productCatalog[selectedCatIndex].products[selectedProdIndex].prices.splice(i,1); renderCatalogSettings(); }
+function updatePriceVal(idx, f, v) { 
+    let final = v; if(f!=='face') final = parseInt(v)||0; 
+    productCatalog[selectedCatIndex].products[selectedProdIndex].prices[idx][f] = final; 
+}
+
+
+// --- CATALOG SELECTION UI ---
+function renderCatalogSelects() { document.getElementById('inpCategory').innerHTML = productCatalog.map((c,i)=>`<option value="${i}">${c.name}</option>`).join(''); handleCategoryChange(); }
+function handleCategoryChange() {
+    const idx = document.getElementById('inpCategory').value;
+    if(!productCatalog[idx]) return;
+    document.getElementById('inpCardType').innerHTML = productCatalog[idx].products.map((p,i)=>`<option value="${i}">${p.name}</option>`).join('');
+    handleProductChange();
+}
+function handleProductChange() {
+    const cIdx = document.getElementById('inpCategory').value;
+    const pIdx = document.getElementById('inpCardType').value;
+    if(!productCatalog[cIdx] || !productCatalog[cIdx].products[pIdx]) return;
+    const prices = productCatalog[cIdx].products[pIdx].prices;
+    const sel = document.getElementById('inpPriceSelect');
+    const cust = document.getElementById('inpPriceCustom');
+    if(prices.length === 0) { sel.style.display="none"; cust.style.display="block"; cust.value=""; }
+    else { sel.style.display="block"; cust.style.display="none"; sel.innerHTML = prices.map((p,i)=>`<option value="${i}">${formatMoney(p.face)} (Bán: ${formatMoney(p.sell)})</option>`).join(''); }
+    calculateSellingPrice();
+}
+
+
+function calculateSellingPrice() {
+    const cIdx = document.getElementById('inpCategory').value;
+    const pIdx = document.getElementById('inpCardType').value;
+    const prIdx = document.getElementById('inpPriceSelect').value;
+    const prod = productCatalog[cIdx]?.products[pIdx];
+    let face="", sell=0, name=prod?prod.name:"Custom", sur=0;
+    if(prod && prod.prices.length > 0) { const p=prod.prices[prIdx]; face=p.face; sur=p.surcharge||0; sell=p.sell+sur; }
+    else { face=parseInt(document.getElementById('inpPriceCustom').value)||0; sell=face; }
+    document.getElementById('sellingPricePreview').innerText = formatMoney(sell) + " đ";
+    return { faceValue: face, sellingPrice: sell, productName: name };
+}
+// --- SMART SEARCH (FEATURE 2) ---
+function handleSmartSearch(e) {
+    const val = e.target.value.toLowerCase().trim();
+    const results = document.getElementById('smartSearchResults');
+    if(val.length < 2) { results.style.display='none'; return; }
+
+
+    const matches = [];
+    const numMatch = val.match(/\d+/);
+    const num = numMatch ? numMatch[0] : "";
+    const kw = val.replace(/\d+/, "").trim();
+
+
+    productCatalog.forEach((cat, cIdx) => {
+        cat.products.forEach((prod, pIdx) => {
+            if(prod.name.toLowerCase().includes(kw)) {
+                if(num) {
+                    prod.prices.forEach((pr, prIdx) => {
+                        if(pr.face.toString().includes(num) || (pr.face/1000).toString() === num) {
+                            matches.push({c:cIdx, p:pIdx, pr:prIdx, name: prod.name, face: pr.face, sell: pr.sell});
+                        }
+                    });
+                } else {
+                    prod.prices.forEach((pr, prIdx) => {
+                        matches.push({c:cIdx, p:pIdx, pr:prIdx, name: prod.name, face: pr.face, sell: pr.sell});
+                    });
+                }
+            }
+        });
+    });
+
+
+    if(matches.length > 0) {
+        results.innerHTML = matches.slice(0, 8).map(m => `
+            <div class="smart-item" onclick="selectSmartItem(${m.c}, ${m.p}, ${m.pr})">
+                <span class="smart-name">${m.name} ${formatMoney(m.face)}</span>
+                <span class="smart-price">${formatMoney(m.sell)} đ</span>
+            </div>
+        `).join('');
+        results.style.display='block';
+    } else {
+        results.style.display='none';
+    }
+}
+
+
+function selectSmartItem(cIdx, pIdx, prIdx) {
+    document.getElementById('inpCategory').value = cIdx;
+    handleCategoryChange(); 
+    document.getElementById('inpCardType').value = pIdx;
+    handleProductChange(); 
+    document.getElementById('inpPriceSelect').value = prIdx;
+    calculateSellingPrice(); 
+    
+    document.getElementById('smartSearchResults').style.display='none';
+    document.getElementById('inpSmartSearch').value = "";
+    document.getElementById('inpQty').focus();
+}
+
+
+// --- INVENTORY / AUTO STOCK (FEATURE 3) ---
+function loadInventory() {
+    inventory = JSON.parse(localStorage.getItem('thebao_inventory') || "{}");
+}
+function saveInventory() {
+    localStorage.setItem('thebao_inventory', JSON.stringify(inventory));
+    renderInventoryTab();
+}
+function getInventoryKey(prodName, faceValue) {
+    return `${prodName}_${faceValue}`;
+}
+
+
+function renderInventoryTab() {
+    const list = document.getElementById('inventoryTableBody');
+    const invProd = document.getElementById('invProdSelect');
+    
+    let allProds = [];
+    productCatalog.forEach(c => {
+        c.products.forEach(p => {
+            if(p.prices.length > 0) allProds.push(p);
+        });
+    });
+    
+    if(invProd.innerHTML === "") {
+        invProd.innerHTML = allProds.map(p => `<option value="${p.name}">${p.name}</option>`).join('');
+    }
+    updateInvPriceSelect();
+
+
+    let rows = "";
+    for (const [key, codes] of Object.entries(inventory)) {
+        if(codes.length > 0) {
+            const [name, face] = key.split('_');
+            rows += `<tr>
+                <td>${name}</td>
+                <td>${formatMoney(face)}</td>
+                <td class="stock-count">${codes.length}</td>
+                <td><button class="btn-mini btn-danger" onclick="clearStock('${key}')">Xóa</button></td>
+            </tr>`;
+        }
+    }
+    if(rows === "") rows = "<tr><td colspan='4' style='text-align:center;color:#999'>Kho trống</td></tr>";
+    list.innerHTML = rows;
+}
+
+
+function updateInvPriceSelect() {
+    const prodName = document.getElementById('invProdSelect').value;
+    let found = null;
+    productCatalog.forEach(c => c.products.forEach(p => { if(p.name===prodName) found=p; }));
+    
+    if(found) {
+        document.getElementById('invPriceSelect').innerHTML = found.prices.map(pr => `<option value="${pr.face}">${formatMoney(pr.face)}</option>`).join('');
+    }
+}
+
+
+function importToInventory() {
+    const prodName = document.getElementById('invProdSelect').value;
+    const face = document.getElementById('invPriceSelect').value;
+    const raw = document.getElementById('invInputArea').value.trim();
+    
+    if(!prodName || !face) return alert("Vui lòng chọn sản phẩm!");
+    if(!raw) return alert("Chưa nhập mã thẻ!");
+
+
+    const key = getInventoryKey(prodName, face);
+    if(!inventory[key]) inventory[key] = [];
+
+
+    const lines = raw.split(/\n/);
+    let count = 0;
+    lines.forEach(line => {
+        if(line.trim()) {
+            let parts = line.split(/[\t|]/);
+            let code = parts[0].trim();
+            let seri = parts.length > 1 ? parts[1].trim() : "";
+            
+            inventory[key].push({code, serial: seri});
+            count++;
+        }
+    });
+
+
+    saveInventory();
+    document.getElementById('invInputArea').value = "";
+    alert(`✅ Đã thêm ${count} thẻ vào kho!`);
+}
+
+
+function clearStock(key) {
+    if(confirm("Xóa toàn bộ mã của loại này?")) {
+        delete inventory[key];
+        saveInventory();
+    }
+}
+
+
+// --- CART & INVOICE ---
+function toggleBulk() { const b = document.getElementById('bulkBox'); b.style.display = b.style.display==='none'?'block':'none'; }
+function processBulkData() {
+    const raw = document.getElementById('bulkArea').value;
+    if(!raw.trim()) return alert("Chưa có dữ liệu!");
+    const lines = raw.trim().split(/\n/).filter(l=>l.trim()!=='');
+    document.getElementById('inpQty').value = lines.length;
+    renderInputFields();
+    const codes = document.querySelectorAll('.sub-code');
+    const seris = document.querySelectorAll('.sub-serial');
+    lines.forEach((line, i) => {
+        if(i >= codes.length) return;
+        let parts = line.trim().split(/[\t|]+/);
+        if(parts.length===1) parts = line.trim().split(/\s+/);
+        if(parts.length>=1) codes[i].value = parts[0].trim();
+        if(parts.length>=2) seris[i].value = parts[1].trim();
+    });
+    document.getElementById('bulkArea').value="";
+    document.getElementById('bulkBox').style.display='none';
+}
+
+
+function renderInputFields() {
+    const qty = parseInt(document.getElementById('inpQty').value)||1;
+    const con = document.getElementById('dynamicInputs');
+    let old = []; document.querySelectorAll('.sub-code').forEach((e,i)=>old.push({c:e.value, s:document.querySelectorAll('.sub-serial')[i]?.value||''}));
+    con.innerHTML="";
+    for(let i=0; i<qty; i++) {
+        let r = document.createElement('div'); r.className='code-entry-row';
+        r.innerHTML = `<span>#${i+1}</span><input type="text" class="sub-code" value="${old[i]?old[i].c:''}" placeholder="Mã thẻ" style="flex:1"><input type="text" class="sub-serial" value="${old[i]?old[i].s:''}" placeholder="Seri" style="flex:1">`;
+        con.appendChild(r);
+    }
+}
+
+
+function addToCart() {
+    if(isDebtViewMode) return alert("Thoát chế độ xem nợ trước!");
+    const qty = parseInt(document.getElementById('inpQty').value);
+    const { faceValue, sellingPrice, productName } = calculateSellingPrice();
+    if(qty<1) return;
+    
+    const domCodes = document.querySelectorAll('.sub-code');
+    const domSeris = document.querySelectorAll('.sub-serial');
+    
+    const stockKey = getInventoryKey(productName, faceValue);
+    let usedStockCount = 0;
+    let list = [];
+
+
+    for(let i=0; i<qty; i++) {
+        let c = domCodes[i].value.trim();
+        let s = domSeris[i].value.trim();
+
+
+        if(c === "" && inventory[stockKey] && inventory[stockKey].length > 0) {
+            let item = inventory[stockKey].shift(); 
+            c = item.code;
+            s = item.serial;
+            usedStockCount++;
+        }
+
+
+        list.push({code: c, serial: s});
+    }
+
+
+    if(usedStockCount > 0) {
+        saveInventory();
+    }
+
+
+    cartItems.push({ cardType: productName, faceValue, price: sellingPrice, qty, cardList: list, total: sellingPrice*qty });
+    isOrderSaved = false; renderAll();
+    document.getElementById('inpQty').value=1; renderInputFields();
+}
+
+
+function removeItem(i) { if(isDebtViewMode) return; cartItems.splice(i,1); isOrderSaved=false; renderAll(); }
+function resetCart() { if(confirm("Làm mới toàn bộ?")) { cancelEditMode(); cartItems=[]; generateRandomInvoiceID(); document.getElementById('inpName').value="Khách lẻ"; document.getElementById('inpPhone').value=""; document.getElementById('inpDiscount').value=""; document.getElementById('inpSurcharge').value=""; document.getElementById('inpPrepaid').value=""; document.getElementById('appliedCreditValue').value=0; renderAll(); } }
+
+
+function renderAll(skipCalc=false) {
+    const listUI = document.getElementById('cartListUI');
+    document.getElementById('itemCountBadge').innerText = cartItems.length;
+    if(cartItems.length===0) listUI.innerHTML = '<p style="color:#999;font-style:italic;text-align:center;padding:10px;">Chưa có sản phẩm.</p>';
+    else {
+        listUI.innerHTML = cartItems.map((item, i) => {
+            let faceDisplay = formatMoney(item.faceValue);
+            let label = `${item.cardType}` + (item.faceValue && item.faceValue!=="0" ? (!isNaN(parseFloat(item.faceValue)) ? ` x${faceDisplay}` : ` (${faceDisplay})`) : "");
+            return `<div class="temp-item"><div><strong>${i+1}. ${label}</strong> (${formatMoney(item.price)}) x${item.qty}</div><button class="btn-mini btn-danger" onclick="removeItem(${i})">X</button></div>`;
+        }).join('');
+    }
+
+
+    updateInvoiceHeader();
+    let total = cartItems.reduce((s,i)=>s+i.total,0);
+    document.getElementById('invoiceTableBody').innerHTML = cartItems.map(item => {
+        let faceDisplay = formatMoney(item.faceValue);
+        let fullName = `${item.cardType}` + (item.faceValue && item.faceValue!=="0" ? (!isNaN(parseFloat(item.faceValue)) ? ` x${faceDisplay}` : ` (${faceDisplay})`) : "");
+        let details = item.cardList.map(c => {
+            if(!c.code && !c.serial) return '';
+            return `<div class="card-box">${c.code?`<span class="card-line"><span class="card-label">MÃ:</span><span class="card-val">${formatReadableCode(c.code)}</span></span>`:''} ${c.serial?`<span class="card-line" style="margin-top:2px;border-top:1px dotted #ccc;padding-top:2px;"><span class="card-label" style="color:#7f8c8d;">SERI:</span><span class="card-seri">${c.serial}</span></span>`:''}</div>`;
+        }).join('');
+        return `<tr><td style="padding-top:10px;"><span class="item-name">${fullName}</span><div class="item-sub">${details}</div></td><td style="text-align:center;padding-top:10px;font-weight:bold;">${item.qty}</td><td style="text-align:right;padding-top:10px;font-weight:bold;">${formatMoney(item.total)}</td></tr>`;
+    }).join('');
+
+
+    if(!skipCalc) {
+        const disc = parseInt(document.getElementById('inpDiscount').value)||0;
+        const sur = parseInt(document.getElementById('inpSurcharge').value)||0;
+        const surLbl = document.getElementById('inpSurchargeLabel').value||"Phụ thu";
+        const cred = parseInt(document.getElementById('appliedCreditValue').value)||0;
+        const pre = parseInt(document.getElementById('inpPrepaid').value)||0;
+        
+        let oldDebt = 0;
+        if(document.getElementById('toggleOldDebt').checked) oldDebt = parseInt(document.getElementById('oldDebtToggleBox').dataset.amount)||0;
+
+
+        const final = total + sur - disc - cred + oldDebt;
+        document.getElementById('outSubTotal').innerText = formatMoney(total) + " đ";
+        
+        const rSur = document.getElementById('rowSurcharge'); rSur.style.display = sur>0?'flex':'none';
+        document.getElementById('outSurchargeLabel').innerText = surLbl+":"; document.getElementById('outSurchargeVal').innerText = "+"+formatMoney(sur)+" đ";
+        
+        document.getElementById('rowDiscount').style.display = disc>0?'flex':'none'; document.getElementById('outDiscountVal').innerText = "-"+formatMoney(disc)+" đ";
+        document.getElementById('rowCreditUsed').style.display = cred>0?'flex':'none'; document.getElementById('outCreditUsedVal').innerText = "-"+formatMoney(cred)+" đ";
+        document.getElementById('rowOldDebtAdded').style.display = oldDebt>0?'flex':'none'; document.getElementById('outOldDebtAddedVal').innerText = "+"+formatMoney(oldDebt)+" đ";
+        
+        document.getElementById('outFinalTotal').innerText = formatMoney(final) + " đ";
+        
+        const rPre = document.getElementById('rowPrepaid');
+        if(pre>0 && pre<final) { rPre.style.display="flex"; document.getElementById('outPrepaidVal').innerText = "-"+formatMoney(pre)+" đ"; } 
+        else rPre.style.display="none";
+
+
+        if(pre>=final && final>0 && !isPaid) setPaymentStatus(true);
+        setPaymentStatus(isPaid);
+    }
+}
+
+
+function updateInvoiceHeader() {
+    document.getElementById('outBrandName').innerText = storeConfig.brandName;
+    document.getElementById('outSlogan').innerText = storeConfig.slogan;
+    document.getElementById('outHotline').innerText = `☎ Hotline: ${storeConfig.hotline}`;
+    document.getElementById('outHotlineFooter').innerText = storeConfig.hotline;
+    const name = document.getElementById('inpName').value;
+    const phone = document.getElementById('inpPhone').value;
+    const date = document.getElementById('inpDate').value;
+    const dStr = date ? `${date.split('-')[2]}/${date.split('-')[1]}/${date.split('-')[0]}` : "...";
+    let code = document.getElementById('inpInvoiceID').value.toUpperCase();
+    if(!code.startsWith("TB")) code="TB"+code;
+    document.getElementById('outDate').innerText = `${dStr} - ${document.getElementById('inpTime').value}`;
+    document.getElementById('outName').innerText = name || "Khách lẻ";
+    document.getElementById('outInvoiceID').innerText = code;
+    document.getElementById('rowPhone').style.display = phone?"flex":"none";
+    document.getElementById('outPhone').innerText = phone;
+    
+    const pubNote = document.getElementById('inpPublicNote').value;
+    document.getElementById('outPublicNoteBox').style.display = pubNote.trim()?'block':'none';
+    document.getElementById('outPublicNoteContent').innerText = pubNote;
+    
+    checkCreditDisplay(); renderTrackingCodes(code); renderQR();
+}
+// --- PAYMENT & ACTIONS ---
+function setPayment(m) { 
+    currentPaymentMethod = m; 
+    document.querySelectorAll('.pay-btn:not(.status-btn)').forEach(b=>b.classList.remove('active'));
+    document.getElementById(`btnPay${m}`).classList.add('active');
+    document.getElementById('outPaymentMethod').innerText = m==='CASH'?'Tiền mặt':(m==='TRANSFER'?'Chuyển khoản':'Ghi nợ');
+    if(m==='DEBT') setPaymentStatus(false);
+    renderQR();
+}
+function setPaymentStatus(s) { 
+    isPaid = s;
+    document.getElementById('btnStatusUnpaid').classList.toggle('active-unpaid', !s);
+    document.getElementById('btnStatusPaid').classList.toggle('active-paid', s);
+    const el = document.getElementById('outPaymentStatusHTML');
+    if(s) el.innerHTML = '<span class="paid-stamp">ĐÃ THANH TOÁN</span>';
+    else el.innerHTML = currentPaymentMethod==='DEBT' ? '<span class="debt-stamp">GHI NỢ</span>' : '<span style="color:#e74c3c;font-weight:bold;">Chưa thanh toán</span>';
+    renderQR();
+}
+
+
+function renderQR(amt=null) {
+    const qr = document.getElementById('qrSection');
+    
+    if(isPaid && currentPaymentMethod === 'CASH') {
+        qr.style.display = 'none';
+        return;
+    }
+
+
+    let total = parseInt(document.getElementById('outFinalTotal').innerText.replace(/\D/g,''))||0;
+    let pre = parseInt(document.getElementById('inpPrepaid').value)||0;
+    let final = amt!==null ? amt : (total - pre);
+    
+    if(final<=0 || (!isDebtViewMode && (currentPaymentMethod==='CASH' || isPaid) && pre>=total)) { qr.style.display='none'; return; }
+    qr.style.display='block';
+    
+    const content = (isDebtViewMode?"Tra no ":"TT ") + document.getElementById('inpInvoiceID').value;
+    const url = `https://img.vietqr.io/image/${storeConfig.bankId}-${storeConfig.accNum}-compact.png?amount=${final}&addInfo=${encodeURIComponent(content)}&accountName=${encodeURIComponent(storeConfig.accName)}`;
+    document.getElementById('qrImage').src = url;
+    const sel = document.getElementById('cfgBankId');
+    document.getElementById('qrBankName').innerText = sel.options[sel.selectedIndex].text;
+    document.getElementById('qrAccNum').innerText = `STK: ${storeConfig.accNum}`;
+}
+
+
+// --- DEBT & CUSTOMER LOGIC ---
+function getDebtList() { return JSON.parse(localStorage.getItem('thebao_debt_list')||"[]"); }
+function saveDebtList(l) { localStorage.setItem('thebao_debt_list', JSON.stringify(l)); }
+
+
+function checkOldDebt(phone) {
+    const list = getDebtList();
+    const box = document.getElementById('oldDebtToggleBox');
+    if(phone.length<8) { box.style.display='none'; return; }
+    let total = list.filter(d => d.phone===phone && d.remainingAmount>0).reduce((s,d)=>s+d.remainingAmount,0);
+    if(total>0) {
+        box.style.display='flex'; document.getElementById('lblOldDebtVal').innerText = formatMoney(total);
+        box.dataset.amount = total;
+    } else { box.style.display='none'; document.getElementById('toggleOldDebt').checked=false; box.dataset.amount=0; }
+    renderAll();
+}
+
+
+function addDebtRecord(order, total, paid=0) {
+    let list = getDebtList();
+    if(list.some(d=>d.orderId===order.id)) return;
+    list.unshift({ id:'DEBT_'+Date.now(), orderId:order.id, date:order.date, name:order.name, phone:order.phone, originalAmount:total, paidAmount:paid, remainingAmount:total-paid, items:order.cart });
+    saveDebtList(list);
+}
+
+
+function payOldDebtFully(phone) {
+    let list = getDebtList(), changed=false;
+    list.forEach(d => { if(d.phone===phone && d.remainingAmount>0) { d.paidAmount+=d.remainingAmount; d.remainingAmount=0; changed=true; updateHistoryPaidStatus(d.orderId); } });
+    if(changed) saveDebtList(list);
+}
+
+
+function updateHistoryPaidStatus(id) {
+    let h = JSON.parse(localStorage.getItem('invoiceHistory')||"[]");
+    let item = h.find(x=>x.id===id); if(item) { item.isPaid=true; localStorage.setItem('invoiceHistory', JSON.stringify(h)); }
+}
+
+
+function generateCustomerID() {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let result = "";
+    for (let i = 0; i < 6; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return "KH_" + result; 
+}
+
+
+function confirmOrder() {
+    if(isDebtViewMode) return;
+    if(cartItems.length===0) return alert("Giỏ hàng trống!");
+    if(isOrderSaved) return alert("Đơn đã lưu!");
+    
+    let phoneInput = document.getElementById('inpPhone').value.trim();
+    let nameInput = document.getElementById('inpName').value.trim();
+    
+    if (!phoneInput) {
+        phoneInput = generateCustomerID();
+        document.getElementById('inpPhone').value = phoneInput;
+        if(!nameInput || nameInput === "Khách lẻ") {
+            nameInput = "Khách " + phoneInput;
+            document.getElementById('inpName').value = nameInput;
+        }
+    }
+
+
+    let total = parseInt(document.getElementById('outFinalTotal').innerText.replace(/\D/g,''))||0;
+    let pre = parseInt(document.getElementById('inpPrepaid').value)||0;
+    let remain = total - pre;
+    const oldDebtOk = document.getElementById('toggleOldDebt').checked;
+    
+    if(currentPaymentMethod==='DEBT' || (!isPaid && remain>0)) {
+        const order = { id:document.getElementById('inpInvoiceID').value, date:document.getElementById('inpDate').value, name:nameInput, phone:phoneInput, cart:JSON.parse(JSON.stringify(cartItems)) };
+        addDebtRecord(order, total, pre);
+        alert(`📖 Đã ghi nợ cho mã khách: ${phoneInput}!`);
+    }
+    if(oldDebtOk) payOldDebtFully(phoneInput);
+    
+    let cred = parseInt(document.getElementById('appliedCreditValue').value)||0;
+    if(cred>0) useCredit(phoneInput, cred);
+
+
+    updateInvoiceHeader();
+    saveHistory(true);
+    
+    if(!customerList.some(c=>c.phone===phoneInput)) { 
+        const newCus = {name:nameInput, phone:phoneInput};
+        customerList.push(newCus); 
+        localStorage.setItem('thebao_customers', JSON.stringify(customerList)); 
+        if(typeof saveToCloudCollection === 'function') saveToCloudCollection('Customers', phoneInput, newCus);
+    }
+    
+    isOrderSaved=true; alert("✅ Đã lưu đơn hàng!");
+}
+
+
+function saveHistory(isNew=true) {
+    const id = document.getElementById('inpInvoiceID').value;
+    const item = {
+        id: id, date: document.getElementById('inpDate').value, time: document.getElementById('inpTime').value,
+        name: document.getElementById('inpName').value, phone: document.getElementById('inpPhone').value,
+        discount: document.getElementById('inpDiscount').value, surcharge: document.getElementById('inpSurcharge').value,
+        publicNote: document.getElementById('inpPublicNote').value, internalNote: document.getElementById('inpInternalNote').value,
+        payment: currentPaymentMethod, isPaid: isPaid, cart: JSON.parse(JSON.stringify(cartItems)),
+        total: parseInt(document.getElementById('outFinalTotal').innerText.replace(/\D/g,''))
+    };
+    let h = JSON.parse(localStorage.getItem('invoiceHistory')||"[]");
+    if(isNew) { if(!h.some(x=>x.id===id)) h.unshift(item); else { if(confirm("Mã trùng. Ghi đè?")) { let idx=h.findIndex(x=>x.id===id); h[idx]=item; } } }
+    else { let idx=h.findIndex(x=>x.id===id); if(idx!==-1) h[idx]=item; }
+    h.sort((a,b)=>new Date(b.date+' '+b.time)-new Date(a.date+' '+a.time));
+    localStorage.setItem('invoiceHistory', JSON.stringify(h));
+    calculateTodayRevenue();
+}
+
+
+// --- EDIT MODE ---
+function restoreHistory(id) {
+    let h = JSON.parse(localStorage.getItem('invoiceHistory')||"[]").find(x=>x.id===id);
+    if(!h) return;
+    if(cartItems.length>0 && !isEditMode && !confirm("Đè đơn hiện tại?")) return;
+    closeModal('historyModal');
+    isEditMode=true;
+    
+    document.getElementById('groupStandardBtns').style.display='none';
+    document.getElementById('groupEditBtns').style.display='block';
+    document.getElementById('editModeNotice').style.display='flex';
+    document.getElementById('lblEditID').innerText = h.id;
+    document.getElementById('inpInvoiceID').disabled=true;
+    
+    document.getElementById('inpInvoiceID').value=h.id; document.getElementById('inpDate').value=h.date; document.getElementById('inpTime').value=h.time;
+    document.getElementById('inpName').value=h.name; document.getElementById('inpPhone').value=h.phone;
+    document.getElementById('inpDiscount').value=h.discount; document.getElementById('inpSurcharge').value=h.surcharge||"";
+    document.getElementById('inpPublicNote').value=h.publicNote||""; document.getElementById('inpInternalNote').value=h.internalNote||"";
+    cartItems=h.cart; setPayment(h.payment||'CASH'); setPaymentStatus(h.isPaid);
+    renderAll();
+}
+
+
+function cancelEditMode() {
+    isEditMode=false; isDebtViewMode=false;
+    document.getElementById('groupStandardBtns').style.display='block';
+    document.getElementById('groupEditBtns').style.display='none';
+    document.getElementById('groupDebtBtns').style.display='none';
+    document.getElementById('editModeNotice').style.display='none';
+    document.getElementById('inpInvoiceID').disabled=false;
+    document.getElementById('invHeaderBg').classList.remove('debt-header');
+    document.getElementById('lblInvoiceTitle').innerText="HÓA ĐƠN BÁN HÀNG"; document.getElementById('lblInvoiceTitle').style.color="#004e92";
+    document.getElementById('lblTotalLabel').style.color="#333"; document.getElementById('lblTotalLabel').innerText="TỔNG CỘNG:";
+    document.getElementById('rowPaidAmount').style.display='none';
+    cartItems=[]; generateRandomInvoiceID(); document.getElementById('inpSurcharge').value=""; document.getElementById('inpPrepaid').value="";
+    renderAll();
+}
+
+
+function saveEditedOrder() {
+    if(!isEditMode) return;
+    saveHistory(false);
+    
+    let id = document.getElementById('inpInvoiceID').value;
+    let list = getDebtList();
+    let d = list.find(x=>x.orderId===id);
+    if(d) {
+        let tot = parseInt(document.getElementById('outFinalTotal').innerText.replace(/\D/g,''));
+        let pre = parseInt(document.getElementById('inpPrepaid').value)||0;
+        d.name = document.getElementById('inpName').value; d.phone = document.getElementById('inpPhone').value;
+        d.originalAmount=tot; 
+        if(isPaid) { d.paidAmount=tot; d.remainingAmount=0; } else { d.paidAmount=pre; d.remainingAmount=tot-pre; }
+        saveDebtList(list);
+    }
+    alert("✅ Đã cập nhật!"); cancelEditMode();
+}
+
+
+// --- HISTORY DETAIL VIEW ---
+function viewHistoryDetail(id) {
+    let h = JSON.parse(localStorage.getItem('invoiceHistory')||"[]").find(x=>x.id===id);
+    if(!h) return;
+
+
+    document.getElementById('hist_outBrandName').innerText = storeConfig.brandName;
+    document.getElementById('hist_outSlogan').innerText = storeConfig.slogan;
+    document.getElementById('hist_outHotline').innerText = `☎ Hotline: ${storeConfig.hotline}`;
+    document.getElementById('hist_outHotlineFooter').innerText = storeConfig.hotline;
+    document.getElementById('hist_outInvoiceID').innerText = h.id;
+    document.getElementById('hist_outDate').innerText = `${h.date.split('-')[2]}/${h.date.split('-')[1]}/${h.date.split('-')[0]} - ${h.time}`;
+    document.getElementById('hist_outName').innerText = h.name;
+    document.getElementById('hist_outPhone').innerText = h.phone;
+    document.getElementById('hist_rowPhone').style.display = h.phone ? 'flex' : 'none';
+    document.getElementById('hist_outPaymentMethod').innerText = h.payment === 'CASH' ? 'Tiền mặt' : (h.payment === 'TRANSFER' ? 'Chuyển khoản' : 'Ghi nợ');
+    
+    if(h.isPaid) document.getElementById('hist_outPaymentStatusHTML').innerHTML = '<span class="paid-stamp">ĐÃ THANH TOÁN</span>';
+    else document.getElementById('hist_outPaymentStatusHTML').innerHTML = h.payment === 'DEBT' ? '<span class="debt-stamp">GHI NỢ</span>' : '<span style="color:#e74c3c;font-weight:bold;">Chưa thanh toán</span>';
+
+
+    document.getElementById('hist_invoiceTableBody').innerHTML = h.cart.map(item => {
+        let faceDisplay = formatMoney(item.faceValue);
+        let fullName = `${item.cardType}` + (item.faceValue && item.faceValue!=="0" ? (!isNaN(parseFloat(item.faceValue)) ? ` x${faceDisplay}` : ` (${faceDisplay})`) : "");
+        let details = item.cardList ? item.cardList.map(c => {
+            if(!c.code && !c.serial) return '';
+            return `<div class="card-box">${c.code?`<span class="card-line"><span class="card-label">MÃ:</span><span class="card-val">${formatReadableCode(c.code)}</span></span>`:''} ${c.serial?`<span class="card-line" style="margin-top:2px;border-top:1px dotted #ccc;padding-top:2px;"><span class="card-label" style="color:#7f8c8d;">SERI:</span><span class="card-seri">${c.serial}</span></span>`:''}</div>`;
+        }).join('') : '';
+        return `<tr><td style="padding-top:10px;"><span class="item-name">${fullName}</span><div class="item-sub">${details}</div></td><td style="text-align:center;padding-top:10px;font-weight:bold;">${item.qty}</td><td style="text-align:right;padding-top:10px;font-weight:bold;">${formatMoney(item.total)}</td></tr>`;
+    }).join('');
+
+
+    let total = h.cart.reduce((s,i)=>s+i.total,0);
+    let disc = parseInt(h.discount)||0;
+    let sur = parseInt(h.surcharge)||0;
+    let final = total + sur - disc;
+    
+    document.getElementById('hist_outSubTotal').innerText = formatMoney(total) + " đ";
+    document.getElementById('hist_rowSurcharge').style.display = sur>0?'flex':'none';
+    document.getElementById('hist_outSurchargeVal').innerText = "+"+formatMoney(sur)+" đ";
+    document.getElementById('hist_rowDiscount').style.display = disc>0?'flex':'none';
+    document.getElementById('hist_outDiscountVal').innerText = "-"+formatMoney(disc)+" đ";
+    document.getElementById('hist_outFinalTotal').innerText = formatMoney(final) + " đ";
+
+
+    document.getElementById('hist_outPublicNoteBox').style.display = h.publicNote && h.publicNote.trim() ? 'block' : 'none';
+    document.getElementById('hist_outPublicNoteContent').innerText = h.publicNote || "";
+
+
+    const qr = document.getElementById('hist_qrSection');
+    if(final > 0 && (!h.isPaid)) {
+        qr.style.display='block';
+        const content = (h.payment==='DEBT'?"Tra no ":"TT ") + h.id;
+        const url = `https://img.vietqr.io/image/${storeConfig.bankId}-${storeConfig.accNum}-compact.png?amount=${final}&addInfo=${encodeURIComponent(content)}&accountName=${encodeURIComponent(storeConfig.accName)}`;
+        document.getElementById('hist_qrImage').src = url;
+        const sel = document.getElementById('cfgBankId');
+        document.getElementById('hist_qrBankName').innerText = storeConfig.bankId;
+        document.getElementById('hist_qrAccNum').innerText = `STK: ${storeConfig.accNum}`;
+    } else {
+        qr.style.display='none';
+    }
+    
+    const qBox = document.getElementById('hist_trackingQrCode'); qBox.innerHTML=""; 
+    new QRCode(qBox, {text:"https://gemini.google.com/gem/12mcKhrxsT76JdEKzA8dLaHZS94ZIHJFZ?usp=sharing", width:65, height:65});
+    JsBarcode("#hist_trackingBarcode", h.id, {format:"CODE128", width:1.5, height:35, displayValue:true, fontSize:12, margin:0});
+
+
+    document.getElementById('historyDetailModal').style.display = 'flex';
+}
+
+
+function printHistoryDetail() {
+    document.body.classList.add('printing-history');
+    window.print();
+    setTimeout(() => { document.body.classList.remove('printing-history'); }, 1000);
+}
+
+
+function downloadHistoryDetail() {
+    const element = document.getElementById('historyInvoiceArea');
+    const originalMaxHeight = element.style.maxHeight;
+    const originalOverflow = element.style.overflow;
+
+
+    element.style.maxHeight = 'none';
+    element.style.overflow = 'visible';
+
+
+    html2canvas(element, { scale: 2, useCORS: true, allowTaint: true }).then(c => {
+        element.style.maxHeight = originalMaxHeight;
+        element.style.overflow = originalOverflow;
+
+
+        const l = document.createElement('a');
+        l.download = 'HD_LichSu.png';
+        l.href = c.toDataURL();
+        l.click();
+    }).catch(err => {
+        element.style.maxHeight = originalMaxHeight;
+        element.style.overflow = originalOverflow;
+        alert("Lỗi tải ảnh: " + err);
+    });
+}
+
+
+function shareHistoryDetail() {
+    const element = document.getElementById('historyInvoiceArea');
+    const originalMaxHeight = element.style.maxHeight;
+    const originalOverflow = element.style.overflow;
+
+
+    element.style.maxHeight = 'none';
+    element.style.overflow = 'visible';
+
+
+    html2canvas(element, { scale: 2, useCORS: true, allowTaint: true }).then(c => {
+        element.style.maxHeight = originalMaxHeight;
+        element.style.overflow = originalOverflow;
+
+
+        c.toBlob(b => {
+            const f = new File([b], "HD_LichSu.png", { type: "image/png" });
+            if (navigator.share) {
+                navigator.share({ files: [f] }).catch(err => console.log(err));
+            } else {
+                const l = document.createElement('a');
+                l.download = 'HD_LichSu.png';
+                l.href = c.toDataURL();
+                l.click();
+            }
+        });
+    }).catch(err => {
+        element.style.maxHeight = originalMaxHeight;
+        element.style.overflow = originalOverflow;
+        alert("Lỗi chia sẻ: " + err);
+    });
+}
+
+
+// --- DEBT VIEW ---
+function viewDebtInvoice(did) {
+    let list = getDebtList(); let d = list.find(x=>x.id===did); if(!d) return;
+    closeModal('debtModal'); isDebtViewMode=true;
+    document.getElementById('groupStandardBtns').style.display='none';
+    document.getElementById('groupEditBtns').style.display='none'; 
+    document.getElementById('groupDebtBtns').style.display='block';
+    document.getElementById('inpInvoiceID').value=d.orderId; document.getElementById('inpName').value=d.name; document.getElementById('inpPhone').value=d.phone; document.getElementById('inpDate').value=d.date;
+    cartItems=d.items;
+    document.getElementById('lblInvoiceTitle').innerText="THÔNG BÁO CÔNG NỢ"; document.getElementById('lblInvoiceTitle').style.color="#c0392b";
+    document.getElementById('invHeaderBg').classList.add('debt-header');
+    renderAll(true);
+    document.getElementById('outSubTotal').innerText=formatMoney(d.originalAmount)+" đ";
+    document.getElementById('rowDiscount').style.display='none'; document.getElementById('rowCreditUsed').style.display='none';
+    document.getElementById('rowPaidAmount').style.display='flex'; document.getElementById('outPaidAmount').innerText=formatMoney(d.paidAmount)+" đ";
+    document.getElementById('lblTotalLabel').innerText="CÒN NỢ:"; document.getElementById('lblTotalLabel').style.color="#c0392b";
+    document.getElementById('outFinalTotal').innerText=formatMoney(d.remainingAmount)+" đ";
+    document.getElementById('outPaymentMethod').innerText="Ghi nợ"; document.getElementById('outPaymentStatusHTML').innerHTML='<span class="debt-stamp">CHƯA THANH TOÁN</span>';
+    renderQR(d.remainingAmount);
+}
+// --- NEW: BACKUP & RESTORE JSONL + PROGRESS ---
+
+
+function updateProgress(percent, secondsRemaining) {
+    const bar = document.getElementById('progressBar');
+    const timeEl = document.getElementById('timeRemaining');
+    bar.style.width = percent + '%';
+    bar.innerText = Math.floor(percent) + '%';
+    
+    if (secondsRemaining !== null && secondsRemaining > 0) {
+        const mins = Math.floor(secondsRemaining / 60);
+        const secs = Math.floor(secondsRemaining % 60);
+        timeEl.innerText = `Còn khoảng: ${mins} phút ${secs} giây...`;
+    } else if (percent >= 100) {
+        timeEl.innerText = "Hoàn tất! Đang xử lý cuối cùng...";
+    } else {
+        timeEl.innerText = "Đang tính toán thời gian...";
+    }
+}
+
+
+function showProgressModal(title) {
+    document.getElementById('progressModal').style.display = 'flex';
+    document.getElementById('progressTitle').innerText = title;
+    document.getElementById('btnCloseProgress').style.display = 'none';
+    updateProgress(0, null);
+}
+
+
+function closeProgressModal() {
+     document.getElementById('progressModal').style.display = 'none';
+}
+
+
+function formatTime(ms) {
+    if (!ms || ms < 0) return "0s";
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    return m > 0 ? `${m}m ${s%60}s` : `${s}s`;
+}
+
+
+// 1. BACKUP (JSONL)
+async function backupDataJSONL() {
+    showProgressModal("ĐANG ĐÓNG GÓI DỮ LIỆU...");
+    const startStr = document.getElementById('backupStart').value;
+    const endStr = document.getElementById('backupEnd').value;
+    const start = startStr ? new Date(startStr) : null;
+    const end = endStr ? new Date(endStr) : null;
+    if(end) end.setHours(23,59,59);
+
+
+    const inRange = (dStr) => { if(!dStr) return true; const d=new Date(dStr); return (!start || d>=start) && (!end || d<=end); };
+
+
+    const meta = {
+        type: 'meta',
+        configs: localStorage.getItem('thebao_store_config'),
+        catalog: localStorage.getItem('thebao_catalog_v6'),
+        customers: localStorage.getItem('thebao_customers'),
+        credits: localStorage.getItem('thebao_customer_credit'),
+        inventory: localStorage.getItem('thebao_inventory') 
+    };
+    
+    const chunks = [JSON.stringify(meta) + '\n'];
+    const history = JSON.parse(localStorage.getItem('invoiceHistory')||"[]").filter(h=>inRange(h.date));
+    const debts = JSON.parse(localStorage.getItem('thebao_debt_list')||"[]").filter(d=>inRange(d.date));
+
+
+    const totalItems = history.length + debts.length;
+    let processed = 0;
+
+
+    const processBatch = async () => {
+        for (let item of history) {
+            chunks.push(JSON.stringify({type: 'history', data: item}) + '\n');
+            processed++;
+            if(processed % 100 === 0) {
+                 const pct = (processed / totalItems) * 100;
+                 updateProgress(pct, null); 
+                 await new Promise(r => setTimeout(r, 0)); 
+            }
+        }
+
+
+        for (let item of debts) {
+            chunks.push(JSON.stringify({type: 'debt', data: item}) + '\n');
+            processed++;
+             if(processed % 100 === 0) {
+                 const pct = (processed / totalItems) * 100;
+                 updateProgress(pct, null);
+                 await new Promise(r => setTimeout(r, 0));
+            }
+        }
+
+
+        updateProgress(100, 0);
+        
+        const blob = new Blob(chunks, {type: "application/x-jsonlines"});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `Backup_Full_${new Date().toISOString().slice(0,10)}.jsonl`;
+        a.click();
+        URL.revokeObjectURL(url);
+        
+        closeProgressModal();
+    };
+
+
+    setTimeout(processBatch, 100);
+}
+
+
+// 2. RESTORE (JSONL Chunked)
+function triggerRestoreJSONL(mode) {
+    restoreMode = mode;
+    document.getElementById('fileRestoreJSONL').click();
+}
+
+
+function restoreDataJSONL(input) {
+    const file = input.files[0];
+    if (!file) return;
+
+
+    showProgressModal("ĐANG KHÔI PHỤC DỮ LIỆU...");
+    
+    const chunkSize = 5 * 1024 * 1024; 
+    let offset = 0;
+    const fileSize = file.size;
+    let startTime = Date.now();
+    let partialLine = ""; 
+    
+    let newHistory = [];
+    let newDebts = [];
+    let newConfigs = null, newCatalog = null, newCustomers = null, newCredits = null, newInventory = null;
+    let countH = 0, countD = 0;
+
+
+    const currentHistory = JSON.parse(localStorage.getItem('invoiceHistory')||"[]");
+    const currentDebts = JSON.parse(localStorage.getItem('thebao_debt_list')||"[]");
+    const currentHistoryIds = new Set(currentHistory.map(x=>x.id));
+    const currentDebtIds = new Set(currentDebts.map(x=>x.id));
+
+
+    const reader = new FileReader();
+
+
+    reader.onload = function(e) {
+        const chunk = e.target.result;
+        const lines = (partialLine + chunk).split('\n');
+        
+        partialLine = offset + chunkSize < fileSize ? lines.pop() : "";
+
+
+        for (let line of lines) {
+            if(!line.trim()) continue;
+            try {
+                const obj = JSON.parse(line);
+                if (obj.type === 'meta') {
+                    newConfigs = obj.configs;
+                    newCatalog = obj.catalog;
+                    newCustomers = obj.customers;
+                    newCredits = obj.credits;
+                    newInventory = obj.inventory;
+                } else if (obj.type === 'history') {
+                     if (!currentHistoryIds.has(obj.data.id)) {
+                         newHistory.push(obj.data);
+                         countH++;
+                     }
+                } else if (obj.type === 'debt') {
+                     if (!currentDebtIds.has(obj.data.id)) {
+                         newDebts.push(obj.data);
+                         countD++;
+                     }
+                }
+            } catch (err) {
+                console.error("Lỗi dòng JSON:", err);
+            }
+        }
+
+
+        offset += chunkSize;
+        
+        const progress = Math.min((offset / fileSize) * 100, 100);
+        const elapsedTime = (Date.now() - startTime) / 1000; 
+        const speed = offset / elapsedTime; 
+        const remainingBytes = fileSize - offset;
+        const remainingTime = speed > 0 ? remainingBytes / speed : 0;
+        
+        updateProgress(progress, remainingTime);
+
+
+        if (offset < fileSize) {
+            readNextChunk();
+        } else {
+            finishRestore();
+        }
+    };
+
+
+    reader.onerror = function() {
+        alert("Lỗi đọc file!");
+        closeProgressModal();
+    };
+
+
+    function readNextChunk() {
+        const slice = file.slice(offset, offset + chunkSize);
+        reader.readAsText(slice);
+    }
+
+
+    function finishRestore() {
+        try {
+            const finalHistory = [...newHistory, ...currentHistory];
+            finalHistory.sort((a,b)=>new Date(b.date+' '+b.time)-new Date(a.date+' '+a.time));
+            
+            const finalDebts = [...newDebts, ...currentDebts];
+            finalDebts.sort((a,b)=>new Date(b.date) - new Date(a.date));
+
+
+            localStorage.setItem('invoiceHistory', JSON.stringify(finalHistory));
+            localStorage.setItem('thebao_debt_list', JSON.stringify(finalDebts));
+
+
+            if (newConfigs && confirm("Bạn có muốn khôi phục cả Cấu hình Shop, Danh mục SP, Kho thẻ & Khách hàng không?")) {
+                 if(newConfigs) localStorage.setItem('thebao_store_config', newConfigs);
+                 if(newCatalog) localStorage.setItem('thebao_catalog_v6', newCatalog);
+                 if(newCustomers) localStorage.setItem('thebao_customers', newCustomers);
+                 if(newCredits) localStorage.setItem('thebao_customer_credit', newCredits);
+                 if(newInventory) localStorage.setItem('thebao_inventory', newInventory);
+            }
+
+
+            document.getElementById('progressTitle').innerText = "HOÀN TẤT!";
+            document.getElementById('progressAction').innerText = `Đã thêm ${countH} đơn hàng và ${countD} công nợ.`;
+            document.getElementById('btnCloseProgress').style.display = 'inline-block';
+            
+            alert("✅ Khôi phục thành công!");
+            location.reload();
+
+
+        } catch (e) {
+            alert("❌ Lỗi Quota: Trình duyệt không đủ bộ nhớ để lưu lượng dữ liệu này. Hãy xóa bớt đơn cũ hoặc dùng máy tính khác.");
+            closeProgressModal();
+        }
+    }
+
+
+    readNextChunk();
+}
+
+
+// Partial Backups (Old Functions kept)
+function exportShopConfig() {
+    const cfg = localStorage.getItem('thebao_store_config') || "{}";
+    downloadJSON(JSON.parse(cfg), "Config_Shop.json");
+}
+function importShopConfig(inp) {
+    const f = inp.files[0]; if(!f) return;
+    const r = new FileReader();
+    r.onload = function(e) {
+        try {
+            const d = JSON.parse(e.target.result);
+            if(d.brandName) {
+                localStorage.setItem('thebao_store_config', JSON.stringify(d));
+                alert("✅ Đã cập nhật cấu hình shop!");
+                location.reload();
+            } else alert("File không hợp lệ!");
+        } catch(err) { alert("Lỗi file JSON!"); }
+    };
+    r.readAsText(f);
+}
+function exportCatalog() {
+    const cat = localStorage.getItem('thebao_catalog_v6') || "[]";
+    downloadJSON(JSON.parse(cat), "Products_Catalog.json");
+}
+function importCatalog(inp) {
+    const f = inp.files[0]; if(!f) return;
+    const r = new FileReader();
+    r.onload = function(e) {
+        try {
+            const d = JSON.parse(e.target.result);
+            if(Array.isArray(d)) {
+                localStorage.setItem('thebao_catalog_v6', JSON.stringify(d));
+                alert("✅ Đã cập nhật danh sách sản phẩm!");
+                location.reload();
+            } else alert("File không hợp lệ!");
+        } catch(err) { alert("Lỗi file JSON!"); }
+    };
+    r.readAsText(f);
+}
+function exportCustomersExcel() {
+    if(customerList.length === 0) return alert("Danh sách trống!");
+    const data = customerList.map(c => ({ "Ten_Khach": c.name, "SDT": c.phone }));
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "KhachHang");
+    XLSX.writeFile(wb, "DanhBa_KhachHang.xlsx");
+}
+function importCustomersExcel(inp) {
+    const f = inp.files[0]; if(!f) return;
+    const r = new FileReader();
+    r.onload = function(e) {
+        try {
+            const data = new Uint8Array(e.target.result);
+            const wb = XLSX.read(data, {type: 'array'});
+            const ws = wb.Sheets[wb.SheetNames[0]];
+            const json = XLSX.utils.sheet_to_json(ws);
+            let count = 0;
+            json.forEach(row => {
+                const name = row["Ten_Khach"] || row["Tên"] || row["Name"];
+                let phone = row["SDT"] || row["SĐT"] || row["Phone"];
+                if(name && phone) {
+                    phone = String(phone).replace(/'/g,"").trim(); 
+                    if(!customerList.some(c => c.phone === phone)) {
+                        customerList.push({name: name, phone: phone});
+                        count++;
+                    }
+                }
+            });
+            if(count > 0) {
+                localStorage.setItem('thebao_customers', JSON.stringify(customerList));
+                renderCustomerTable();
+                alert(`✅ Đã thêm ${count} khách hàng mới từ danh bạ!`);
+            } else alert("Không tìm thấy khách mới hoặc file lỗi!");
+        } catch(err) { alert("Lỗi đọc file Excel!"); }
+    };
+    r.readAsArrayBuffer(f);
+}
+function downloadJSON(data, filename) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type:"application/json"});
+    const l = document.createElement("a"); l.href=URL.createObjectURL(blob); l.download=filename; l.click();
+}
+
+
+// 5. HISTORY EXCEL
+function exportHistoryToExcel() {
+    let h = JSON.parse(localStorage.getItem('invoiceHistory') || "[]");
+    if(h.length === 0) return alert("Không có dữ liệu để xuất!");
+    const data = h.map(item => {
+        let prodSum = item.cart ? item.cart.map(c => `${c.cardType} x${c.qty}`).join(', ') : "";
+        
+        return {
+            "Mã HĐ": item.id,
+            "Ngày": item.date,
+            "Giờ": item.time,
+            "Tên Khách": item.name,
+            "SĐT": item.phone,
+            "Sản phẩm": prodSum,
+            "Tổng tiền": item.total,
+            "Thanh toán": item.payment,
+            "Trạng thái": item.isPaid ? 'Đã TT' : 'Chưa TT',
+            "Ghi chú": item.publicNote || "",
+            "__CartData_JSON__": JSON.stringify(item.cart) 
+        };
+    });
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Lịch Sử Đơn Hàng");
+    XLSX.writeFile(wb, "Backup_HoaDon_Full.xlsx");
+}
+
+
+function exportCurrentCustomerHistory() {
+    if (!currentCrmPhone) return alert("Chưa chọn khách hàng!");
+    let h = JSON.parse(localStorage.getItem('invoiceHistory') || "[]");
+    let cusHistory = h.filter(x => x.phone === currentCrmPhone);
+    if (cusHistory.length === 0) return alert("Khách này chưa có lịch sử mua hàng!");
+
+
+    const data = cusHistory.map(item => {
+        let prodSum = item.cart.map(c => `${c.cardType} x${c.qty}`).join(', ');
+        return {
+            "Mã HĐ": item.id,
+            "Ngày": item.date,
+            "Giờ": item.time,
+            "Tên Khách": item.name,
+            "SĐT": item.phone,
+            "Sản phẩm": prodSum,
+            "Tổng tiền": item.total,
+            "Thanh toán": item.payment === 'CASH' ? 'Tiền mặt' : (item.payment === 'TRANSFER' ? 'Chuyển khoản' : 'Ghi nợ'),
+            "Trạng thái": item.isPaid ? 'Đã TT' : 'Chưa TT',
+            "Ghi chú": item.publicNote || ""
+        };
+    });
+
+
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "LichSu_" + currentCrmPhone);
+    XLSX.writeFile(wb, `LichSu_Khach_${currentCrmPhone}.xlsx`);
+}
+
+
+function triggerImportExcel() { document.getElementById('fileImportExcel').click(); }
+
+
+function importFromExcel(input) {
+    const file = input.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        try {
+            const data = new Uint8Array(e.target.result);
+            const workbook = XLSX.read(data, {type: 'array'});
+            const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+            const jsonData = XLSX.utils.sheet_to_json(firstSheet);
+            if(jsonData.length === 0) return alert("File rỗng!");
+            let currentHist = JSON.parse(localStorage.getItem('invoiceHistory') || "[]");
+            let count = 0;
+            jsonData.forEach(row => {
+                const id = row["Mã HĐ"];
+                if (!currentHist.some(h => h.id === id)) {
+                    let cart = [];
+                    try {
+                        if(row["__CartData_JSON__"]) cart = JSON.parse(row["__CartData_JSON__"]);
+                        else {
+                            let prodName = row["Sản phẩm"] || "Sản phẩm Excel"; 
+                            cart = [{
+                                cardType: prodName, 
+                                faceValue: 0, 
+                                price: row["Tổng tiền"] || 0, 
+                                qty: 1, 
+                                total: row["Tổng tiền"] || 0, 
+                                cardList: [] 
+                            }];
+                        }
+                    } catch(e) { console.log("Lỗi parse cart:", e); }
+                    const newItem = {
+                        id: id,
+                        date: row["Ngày"],
+                        time: row["Giờ"] || "00:00",
+                        name: row["Tên Khách"] || "Khách lẻ",
+                        phone: row["SĐT"] ? String(row["SĐT"]).replace(/'/g,"") : "",
+                        discount: 0, 
+                        surcharge: 0,
+                        publicNote: row["Ghi chú"] || "",
+                        internalNote: "",
+                        payment: row["Thanh toán"] || "CASH",
+                        isPaid: row["Trạng thái"] === 'Đã TT',
+                        cart: cart,
+                        total: row["Tổng tiền"] || 0
+                    };
+                    currentHist.push(newItem);
+                    count++;
+                    if(newItem.phone && newItem.phone.length >= 10 && !customerList.some(c => c.phone === newItem.phone)) {
+                        customerList.push({name: newItem.name, phone: newItem.phone});
+                    }
+                }
+            });
+            if(count > 0) {
+                currentHist.sort((a,b)=>new Date(b.date+' '+b.time)-new Date(a.date+' '+a.time));
+                localStorage.setItem('invoiceHistory', JSON.stringify(currentHist));
+                localStorage.setItem('thebao_customers', JSON.stringify(customerList));
+                alert(`✅ Đã khôi phục thành công ${count} đơn hàng từ Excel!`);
+                location.reload();
+            } else {
+                alert("Không tìm thấy dữ liệu mới hoặc file không đúng định dạng!");
+            }
+        } catch(err) {
+            alert("Lỗi đọc file Excel! Hãy đảm bảo file đúng định dạng .xlsx");
+            console.error(err);
+        }
+    };
+    reader.readAsArrayBuffer(file);
+}
+
+
+function exportHistoryJSONL() {
+    let h = JSON.parse(localStorage.getItem('invoiceHistory') || "[]");
+    if(h.length === 0) return alert("Không có dữ liệu để xuất!");
+    
+    let chunks = [];
+    h.forEach(item => {
+        chunks.push(JSON.stringify({type: 'history', data: item}) + '\n');
+    });
+    
+    const blob = new Blob(chunks, {type: "application/x-jsonlines"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Backup_LichSu_${new Date().toISOString().slice(0,10)}.jsonl`;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+
+function triggerImportHistoryJSONL() {
+    document.getElementById('fileImportHistoryJSONL').click();
+}
+
+
+function importHistoryJSONL(input) {
+    const file = input.files[0];
+    if (!file) return;
+
+
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        try {
+            const lines = e.target.result.split('\n');
+            let currentHist = JSON.parse(localStorage.getItem('invoiceHistory') || "[]");
+            const currentIds = new Set(currentHist.map(x => x.id));
+            let count = 0;
+
+
+            for (let line of lines) {
+                if (!line.trim()) continue;
+                try {
+                    const obj = JSON.parse(line);
+                    if (obj.type === 'history' && obj.data && !currentIds.has(obj.data.id)) {
+                        currentHist.push(obj.data);
+                        count++;
+                    }
+                } catch (err) {
+                    console.error("Lỗi dòng JSON:", err);
+                }
+            }
+
+
+            if (count > 0) {
+                currentHist.sort((a,b)=>new Date(b.date+' '+b.time)-new Date(a.date+' '+a.time));
+                localStorage.setItem('invoiceHistory', JSON.stringify(currentHist));
+                alert(`✅ Đã khôi phục thành công ${count} đơn hàng từ file JSONL!`);
+                location.reload();
+            } else {
+                alert("Không tìm thấy đơn hàng mới nào (hoặc mã đơn đã tồn tại)!");
+            }
+        } catch(err) {
+            alert("Lỗi đọc file JSONL!");
+        }
+    };
+    reader.readAsText(file);
+}
+// --- COMMON UTILS ---
+function generateRandomInvoiceID() { const c="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; let r=""; for(let i=0;i<5;i++) r+=c.charAt(Math.floor(Math.random()*c.length)); document.getElementById('inpInvoiceID').value="TB"+r; updateInvoiceHeader(); renderQR(); }
+function renderTrackingCodes(code) { const q = document.getElementById('trackingQrCode'); q.innerHTML=""; new QRCode(q, {text:"https://gemini.google.com/gem/12mcKhrxsT76JdEKzA8dLaHZS94ZIHJFZ?usp=sharing", width:65, height:65}); JsBarcode("#trackingBarcode", code, {format:"CODE128", width:1.5, height:35, displayValue:true, fontSize:12, margin:0}); }
+function closeModal(id) { document.getElementById(id).style.display='none'; }
+function openHistoryModal() { document.getElementById('historyModal').style.display='flex'; loadHistory(false); }
+function openDebtModal() { document.getElementById('debtModal').style.display='flex'; renderDebtList(); }
+
+
+function calculateTodayRevenue() {
+    const _n = new Date();
+    const _todayStr = `${_n.getFullYear()}-${String(_n.getMonth() + 1).padStart(2, '0')}-${String(_n.getDate()).padStart(2, '0')}`;
+    const t = document.getElementById('inpDate').value || _todayStr;
+
+
+    const h = JSON.parse(localStorage.getItem('invoiceHistory')||"[]");
+    let c=0, tr=0, d=0;
+    h.forEach(x => { if(x.date===t) { if(x.payment==='DEBT' && !x.isPaid) d+=x.total; else if(x.payment==='TRANSFER') tr+=x.total; else c+=x.total; } });
+    document.getElementById('dailyTotalDisplay').innerText = formatMoney(c+tr+d)+" đ";
+    document.getElementById('revCash').innerText = formatMoney(c); document.getElementById('revTransfer').innerText = formatMoney(tr); document.getElementById('revDebt').innerText = formatMoney(d);
+}
+
+
+// --- CUSTOMER & DEBT UI LOGIC ---
+function loadCustomerList() { customerList = JSON.parse(localStorage.getItem('thebao_customers')||"[]"); }
+
+
+function addNewCustomer() {
+    let n = document.getElementById('newCusName').value.trim();
+    let p = document.getElementById('newCusPhone').value.trim();
+
+
+    if (!p) {
+        if(typeof generateCustomerID === 'function') {
+            p = generateCustomerID();
+        } else {
+            const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            let result = "";
+            for (let i = 0; i < 6; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+            p = "KH_" + result;
+        }
+        alert("⚠️ Không có SĐT, hệ thống tự tạo ID: " + p);
+    }
+
+
+    if (customerList.some(c => c.phone === p)) return alert("Mã khách hàng/SĐT này đã tồn tại!");
+
+
+    if (!n) n = "Khách " + p;
+
+
+    const newCus = {name: n, phone: p};
+    customerList.push(newCus);
+    localStorage.setItem('thebao_customers', JSON.stringify(customerList));
+    
+    if(typeof saveToCloudCollection === 'function') saveToCloudCollection('Customers', p, newCus);
+    
+    renderCustomerTable();
+    document.getElementById('newCusName').value = "";
+    document.getElementById('newCusPhone').value = "";
+}
+
+
+function renderCustomerTable() { 
+    const searchBox = document.getElementById('inpSearchCustomer');
+    const keyword = searchBox ? searchBox.value.toLowerCase().trim() : "";
+
+
+    const filteredList = customerList.filter(c => 
+        c.name.toLowerCase().includes(keyword) || 
+        c.phone.includes(keyword)
+    );
+
+
+    const tbody = document.getElementById('customerTableBody');
+    
+    if (filteredList.length > 0) {
+        tbody.innerHTML = filteredList.map(c =>
+            `<tr onclick="openCRM('${c.phone}')"><td>${c.name}</td><td>${c.phone}</td></tr>`
+        ).join('');
+    } else {
+        tbody.innerHTML = '<tr><td colspan="2" style="text-align:center; color:#999; padding:10px; font-style:italic;">Không tìm thấy khách hàng nào</td></tr>';
+    }
+}
+
+
+function syncCustomersFromHistory() {
+    let h = JSON.parse(localStorage.getItem('invoiceHistory')||"[]"), c=0;
+    h.forEach(x=>{ if(x.name!=='Khách lẻ' && x.phone.length===10 && !customerList.some(cu=>cu.phone===x.phone)) { customerList.push({name:x.name, phone:x.phone}); c++; } });
+    localStorage.setItem('thebao_customers', JSON.stringify(customerList)); alert(`Đã thêm ${c} khách.`); renderCustomerTable();
+}
+
+
+function suggestCustomer(inp, type) {
+    const v = inp.value.toLowerCase().trim(); const list = document.getElementById(type==='name'?'suggestList_name':'suggestList_phone');
+    document.querySelectorAll('.suggestion-list').forEach(e=>e.style.display='none');
+    if(!v) return;
+    const matches = customerList.filter(c => type==='name' ? c.name.toLowerCase().includes(v) : c.phone.includes(v)).slice(0,5);
+    if(matches.length===0) return;
+    list.innerHTML = matches.map(c=>`<div class="suggestion-item" onclick="fillCustomer('${c.name}','${c.phone}')"><strong>${c.name}</strong> - ${c.phone}</div>`).join('');
+    list.style.display='block';
+}
+
+
+function fillCustomer(n,p) { document.getElementById('inpName').value=n; document.getElementById('inpPhone').value=p; document.querySelectorAll('.suggestion-list').forEach(e=>e.style.display='none'); updateInvoiceHeader(); checkOldDebt(p); }
+function getCredits() { return JSON.parse(localStorage.getItem('thebao_customer_credit')||"{}"); }
+
+
+function checkCreditDisplay() { 
+    const p = document.getElementById('inpPhone').value; const c = getCredits()[p]||0; 
+    const b = document.getElementById('creditNotificationBox');
+    if(c>0) { b.style.display='flex'; document.getElementById('creditAmountDisplay').innerText=formatMoney(c); document.getElementById('lblCreditHint').style.display='inline'; } 
+    else { b.style.display='none'; document.getElementById('lblCreditHint').style.display='none'; }
+}
+
+
+function applyCreditToOrder() { 
+    const c = getCredits()[document.getElementById('inpPhone').value]||0; 
+    if(c>0) { document.getElementById('appliedCreditValue').value = Math.min(c, parseInt(document.getElementById('outSubTotal').innerText.replace(/\D/g,''))||c); renderAll(); } 
+}
+
+
+function clearCreditManual() { if(confirm("Xóa credit?")) { let c=getCredits(); c[document.getElementById('inpPhone').value]=0; localStorage.setItem('thebao_customer_credit', JSON.stringify(c)); checkCreditDisplay(); } }
+function useCredit(p, amt) { let c=getCredits(); if(c[p]>=amt) { c[p]-=amt; localStorage.setItem('thebao_customer_credit', JSON.stringify(c)); } }
+function switchDebtTab(t) { currentDebtTab=t; document.querySelectorAll('#debtModal .tab-item').forEach(e=>e.classList.remove('active')); document.getElementById(t==='active'?'tabDebtActive':'tabDebtHistory').classList.add('active'); renderDebtList(); }
+
+
+function renderDebtList() {
+    const list=getDebtList(), s=document.getElementById('inpSearchDebt').value.toLowerCase();
+    const filtered = list.filter(d => (currentDebtTab==='active'?d.remainingAmount>0:d.remainingAmount<=0) && (d.name.toLowerCase().includes(s)||d.phone.includes(s)));
+    let tot=list.filter(d=>d.remainingAmount>0).reduce((a,b)=>a+b.remainingAmount,0);
+    let cred=Object.values(getCredits()).reduce((a,b)=>a+b,0);
+    document.getElementById('lblGlobalDebt').innerText = formatMoney(tot)+" đ";
+    document.getElementById('lblGlobalCredit').innerText = formatMoney(cred)+" đ";
+    document.getElementById('debtListContainer').innerHTML = filtered.length===0 ? '<p style="text-align:center;color:#999;">Trống</p>' : 
+        filtered.map(d=>`<div style="background:#fff; border:1px solid #eee; border-left:4px solid ${d.remainingAmount>0?'#c0392b':'#27ae60'}; padding:10px; margin-bottom:5px; border-radius:4px;">
+            <div style="display:flex; justify-content:space-between; font-weight:bold;"><span>${d.name}</span> <span style="color:${d.remainingAmount>0?'#c0392b':'#27ae60'}">${formatMoney(d.remainingAmount)} đ</span></div>
+            <div style="font-size:12px; color:#666;">${d.date} | Mã: ${d.orderId}</div>
+            <div style="text-align:right; margin-top:5px;">
+                <button class="btn-mini btn-info" onclick="viewDebtInvoice('${d.id}')">Xem</button>
+                ${d.remainingAmount>0?`<button class="btn-mini btn-success" onclick="payDebt('${d.id}')">Trả</button>`:''}
+                <button class="btn-mini btn-danger" onclick="deleteDebt('${d.id}')">Xóa</button>
+            </div>
+        </div>`).join('');
+}
+
+
+function payDebt(id) {
+    let l=getDebtList(), d=l.find(x=>x.id===id); if(!d) return;
+    let m = prompt("Nhập số tiền trả:", d.remainingAmount); if(!m) return;
+    let pay = parseInt(m); if(isNaN(pay)) return;
+    let excess = pay - d.remainingAmount;
+    if(excess>0) { if(confirm(`Thừa ${formatMoney(excess)} đ. Lưu Credit?`)) { let c=getCredits(); c[d.phone]=(c[d.phone]||0)+excess; localStorage.setItem('thebao_customer_credit', JSON.stringify(c)); } d.paidAmount+=d.remainingAmount; d.remainingAmount=0; }
+    else { d.paidAmount+=pay; d.remainingAmount-=pay; }
+    if(d.remainingAmount<=0) updateHistoryPaidStatus(d.orderId);
+    saveDebtList(l); renderDebtList(); calculateTodayRevenue();
+}
+
+
+function deleteDebt(id) { if(confirm("Xóa?")) { saveDebtList(getDebtList().filter(x=>x.id!==id)); renderDebtList(); } }
+
+
+function loadHistory(all) {
+    let h = JSON.parse(localStorage.getItem('invoiceHistory')||"[]"), s=document.getElementById('inpSearchHistory').value.toLowerCase();
+    const d1=document.getElementById('histFilterStart').value, d2=document.getElementById('histFilterEnd').value;
+    
+    if(!all && !s && d1 && d2) { 
+        const start=new Date(d1), end=new Date(d2); end.setHours(23,59,59); 
+        h=h.filter(x=>{const d=new Date(x.date); return d>=start && d<=end;}); 
+    }
+    if(s) h=h.filter(x=>x.name.toLowerCase().includes(s)||x.id.toLowerCase().includes(s));
+
+
+    let html = `<div style="padding:10px; background:#f1f1f1; border-bottom:1px solid #ddd; font-weight:bold; display:flex;">
+        <div style="width:30px;"><input type="checkbox" onchange="toggleAllHist(this)"></div>
+        <div style="flex:1;">Thông tin đơn</div>
+        <div style="text-align:right;">Thao tác</div>
+    </div>`;
+
+
+    if(h.length === 0) html += '<p style="text-align:center;color:#999;padding:10px;">Không có đơn hàng.</p>';
+    else {
+        html += h.map(x => `
+            <div class="hist-row" style="padding:10px; border-bottom:1px solid #eee; display:flex; justify-content:space-between; align-items:center;">
+                <div style="width:30px;">
+                    <input type="checkbox" class="hist-check" value="${x.id}">
+                </div>
+                <div style="flex:1;">
+                    <strong>${x.id}</strong> - ${x.name} <span style="color:#666; font-size:11px;">(${x.date} ${x.time})</span><br>
+                    <span style="font-size:12px;">${x.payment === 'DEBT' ? '<span style="color:#c0392b">Ghi nợ</span>' : 'Tiền mặt/CK'} - </span>
+                    <strong style="color:${x.isPaid?'#27ae60':'#c0392b'}">${formatMoney(x.total)} đ</strong>
+                </div>
+                <div style="text-align:right;">
+                    <button class="btn-mini btn-info" onclick="viewHistoryDetail('${x.id}')">Xem</button>
+                    <button class="btn-mini btn-warning" onclick="restoreHistory('${x.id}')">Sửa</button>
+                    <button class="btn-mini btn-danger" onclick="deleteHistoryItem('${x.id}')">Xóa</button>
+                </div>
+            </div>
+        `).join('');
+    }
+    
+    document.getElementById('historyListUI').innerHTML = html;
+    document.getElementById('histLoadMoreBtn').style.display = (all||s)?'none':'block';
+}
+
+
+function toggleAllHist(source) {
+    document.querySelectorAll('.hist-check').forEach(c => c.checked = source.checked);
+}
+
+
+function deleteHistoryItem(id) {
+    if(!confirm(`⚠️ CẢNH BÁO: Bạn có chắc chắn muốn xóa đơn ${id}?\n\n- Mã thẻ (nếu có) sẽ được trả về kho.\n- Công nợ (nếu có) sẽ bị xóa.\n- Doanh thu sẽ bị trừ.`)) return;
+    
+    let h = JSON.parse(localStorage.getItem('invoiceHistory')||"[]");
+    let order = h.find(x => x.id === id);
+    
+    if(order) {
+        if(typeof returnStock === 'function' && order.cart) {
+            order.cart.forEach(item => returnStock(item));
+        }
+
+
+        h = h.filter(x => x.id !== id);
+        localStorage.setItem('invoiceHistory', JSON.stringify(h));
+        
+        if(typeof deleteFromCloudCollection === 'function') {
+            deleteFromCloudCollection('Invoices', id);
+        }
+
+
+        let debts = getDebtList();
+        let relatedDebt = debts.find(d => d.orderId === id);
+        if(relatedDebt) {
+            debts = debts.filter(d => d.orderId !== id);
+            saveDebtList(debts);
+            if(typeof deleteFromCloudCollection === 'function') deleteFromCloudCollection('Debts', relatedDebt.id);
+        }
+        
+        loadHistory(false);
+        calculateTodayRevenue();
+        alert("✅ Đã xóa đơn hàng thành công!");
+    }
+}
+
+
+function deleteSelectedHistory() {
+    const checks = document.querySelectorAll('.hist-check:checked');
+    if(checks.length === 0) return alert("Chưa chọn đơn hàng nào!");
+    
+    if(!confirm(`⚠️ NGUY HIỂM: Bạn sắp xóa vĩnh viễn ${checks.length} đơn hàng.\n\nDữ liệu không thể khôi phục. Tiếp tục?`)) return;
+    
+    let count = 0;
+    checks.forEach(c => {
+        let id = c.value;
+        let h = JSON.parse(localStorage.getItem('invoiceHistory')||"[]");
+        let order = h.find(x => x.id === id);
+        if(order) {
+            if(typeof returnStock === 'function' && order.cart) order.cart.forEach(item => returnStock(item));
+            if(typeof deleteFromCloudCollection === 'function') deleteFromCloudCollection('Invoices', id);
+            
+            let debts = getDebtList();
+            let dIdx = debts.findIndex(d => d.orderId === id);
+            if(dIdx !== -1) {
+                if(typeof deleteFromCloudCollection === 'function') deleteFromCloudCollection('Debts', debts[dIdx].id);
+                debts.splice(dIdx, 1);
+                saveDebtList(debts);
+            }
+        }
+        count++;
+    });
+
+
+    let h = JSON.parse(localStorage.getItem('invoiceHistory')||"[]");
+    const idsToRemove = Array.from(checks).map(c => c.value);
+    h = h.filter(x => !idsToRemove.includes(x.id));
+    localStorage.setItem('invoiceHistory', JSON.stringify(h));
+
+
+    loadHistory(false);
+    calculateTodayRevenue();
+    alert(`✅ Đã xóa ${count} đơn hàng!`);
+}
+
+
+function exportDebtToExcel() {
+    let l=getDebtList(); if(l.length===0) return alert("Trống!");
+    let csv="\uFEFFMã,Ngày,Khách,SĐT,Gốc,Đã Trả,Còn Nợ\n"+l.map(d=>`"${d.orderId}","${d.date}","${d.name}","'${d.phone}",${d.originalAmount},${d.paidAmount},${d.remainingAmount}`).join('\n');
+    const link=document.createElement("a"); link.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'})); link.download="CongNo.csv"; link.click();
+}
+
+
+// --- CRM ---
+let currentCrmPhone = '';
+function openDebtFromCRM() {
+    if (!currentCrmPhone) return;
+    closeModal('customerDetailModal'); 
+    document.getElementById('inpSearchDebt').value = currentCrmPhone;
+    switchDebtTab('active');
+    openDebtModal();
+    renderDebtList(); 
+}
+
+
+function payDebtFromCRM() {
+    const amt = parseInt(document.getElementById('crmPayAmountInput').value);
+    if (!amt || amt <= 0) return alert("Vui lòng nhập số tiền hợp lệ!");
+    openDebtFromCRM();
+    alert("Hệ thống đã chuyển sang Sổ Nợ.\nHãy bấm nút 'Trả' màu xanh tương ứng với đơn hàng cần thanh toán.");
+}
+
+
+function openCRM(phone) {
+    const cus = customerList.find(c => c.phone === phone);
+    if (!cus) return;
+    currentCrmPhone = phone;
+    document.getElementById('crmNameInput').value = cus.name;
+    document.getElementById('crmPhoneInput').value = cus.phone;
+    document.getElementById('crmOriginalPhone').value = cus.phone;
+    document.getElementById('crmFilterStart').value = "";
+    document.getElementById('crmFilterEnd').value = "";
+    document.getElementById('crmSearchInput').value = "";
+    renderCRMHistory();
+    document.getElementById('customerDetailModal').style.display = 'flex';
+}
+
+
+function renderCRMHistory() {
+    let h = JSON.parse(localStorage.getItem('invoiceHistory') || "[]");
+    h = h.filter(x => x.phone === currentCrmPhone);
+    const totalSpend = h.reduce((acc, curr) => acc + curr.total, 0);
+    document.getElementById('crmTotalSpend').innerText = formatMoney(totalSpend) + " đ";
+    const debtList = getDebtList();
+    const currentDebt = debtList
+        .filter(d => d.phone === currentCrmPhone && d.remainingAmount > 0)
+        .reduce((acc, d) => acc + d.remainingAmount, 0);
+    document.getElementById('crmCurrentDebt').innerText = formatMoney(currentDebt) + " đ";
+    const startStr = document.getElementById('crmFilterStart').value;
+    const endStr = document.getElementById('crmFilterEnd').value;
+    const searchStr = document.getElementById('crmSearchInput').value.toLowerCase().trim();
+    if (startStr && endStr) {
+        const s = new Date(startStr);
+        const e = new Date(endStr); e.setHours(23,59,59);
+        h = h.filter(x => { const d = new Date(x.date); return d >= s && d <= e; });
+    }
+    if (searchStr) {
+        h = h.filter(x => x.id.toLowerCase().includes(searchStr));
+    }
+    const tbody = document.getElementById('crmHistoryBody');
+    if (h.length === 0) tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:#999;">Không có đơn hàng nào</td></tr>';
+    else {
+        tbody.innerHTML = h.map(item => {
+            let prodSum = item.cart.map(c => `${c.cardType} x${c.qty}`).join(', ');
+            if(prodSum.length > 30) prodSum = prodSum.substring(0,30) + '...';
+            return `<tr><td><a href="#" onclick="viewHistoryDetail('${item.id}')" style="color:#007bff; text-decoration:none;">${item.id}</a></td><td>${item.date}</td><td>${prodSum}</td><td style="text-align:right;">${formatMoney(item.total)}</td></tr>`;
+        }).join('');
+    }
+}
+
+
+function saveCRMDetails() {
+    const newName = document.getElementById('crmNameInput').value.trim();
+    const newPhone = document.getElementById('crmPhoneInput').value.trim(); 
+    const oldId = document.getElementById('crmOriginalPhone').value; 
+
+
+    if (!newName || !newPhone) return alert("Vui lòng nhập đủ thông tin!");
+
+
+    if (newPhone !== oldId) {
+        if (customerList.some(c => c.phone === newPhone)) {
+            return alert("❌ Số điện thoại này đã thuộc về một khách hàng khác! Vui lòng gộp khách thủ công hoặc chọn số khác.");
+        }
+        if(!confirm(`⚠️ BẠN ĐANG THAY ĐỔI ĐỊNH DANH KHÁCH HÀNG\n\nTừ: ${oldId}\nSang: ${newPhone}\n\nHệ thống sẽ chuyển toàn bộ Lịch sử mua, Công nợ và Tiền thừa sang mã mới này. Tiếp tục?`)) return;
+    }
+
+
+    const idx = customerList.findIndex(c => c.phone === oldId);
+    if (idx !== -1) {
+        customerList[idx].name = newName;
+        customerList[idx].phone = newPhone;
+        localStorage.setItem('thebao_customers', JSON.stringify(customerList));
+        
+        if(typeof deleteFromCloudCollection === 'function' && oldId !== newPhone) {
+            deleteFromCloudCollection('Customers', oldId);
+            saveToCloudCollection('Customers', newPhone, customerList[idx]);
+        } else if (typeof saveToCloudCollection === 'function') {
+            saveToCloudCollection('Customers', newPhone, customerList[idx]);
+        }
+    }
+
+
+    if (newPhone !== oldId) {
+        let history = JSON.parse(localStorage.getItem('invoiceHistory') || "[]");
+        let histChanged = false;
+        history.forEach(h => {
+            if (h.phone === oldId) {
+                h.phone = newPhone;
+                h.name = newName; 
+                histChanged = true;
+                if(typeof saveToCloudCollection === 'function') {
+                    saveToCloudCollection('Invoices', h.id, h);
+                    if(typeof saveToTreeStructure === 'function') saveToTreeStructure(h);
+                }
+            }
+        });
+        if (histChanged) localStorage.setItem('invoiceHistory', JSON.stringify(history));
+
+
+        let debts = getDebtList();
+        let debtChanged = false;
+        debts.forEach(d => {
+            if (d.phone === oldId) {
+                d.phone = newPhone;
+                d.name = newName;
+                debtChanged = true;
+                if(typeof saveToCloudCollection === 'function') saveToCloudCollection('Debts', d.id, d);
+            }
+        });
+        if (debtChanged) saveDebtList(debts);
+
+
+        let credits = getCredits();
+        if (credits[oldId]) {
+            credits[newPhone] = credits[oldId]; 
+            delete credits[oldId]; 
+            localStorage.setItem('thebao_customer_credit', JSON.stringify(credits));
+        }
+    } else {
+        let debts = getDebtList();
+        let debtChanged = false;
+        debts.forEach(d => {
+            if (d.phone === oldId && d.name !== newName) {
+                d.name = newName;
+                debtChanged = true;
+                 if(typeof saveToCloudCollection === 'function') saveToCloudCollection('Debts', d.id, d);
+            }
+        });
+        if (debtChanged) saveDebtList(debts);
+    }
+
+
+    renderCustomerTable();
+    currentCrmPhone = newPhone;
+    document.getElementById('crmOriginalPhone').value = newPhone;
+    
+    alert("✅ Đã cập nhật thông tin và đồng bộ dữ liệu!");
+    renderCRMHistory(); 
+}
+
+
+function printProvisional() { document.getElementById('invoiceArea').classList.add('provisional-hidden'); document.getElementById('lblInvoiceTitle').innerText="HÓA ĐƠN TẠM TÍNH"; setTimeout(()=>{window.print();document.getElementById('invoiceArea').classList.remove('provisional-hidden');document.getElementById('lblInvoiceTitle').innerText="HÓA ĐƠN BÁN HÀNG";},500); }
+function printOfficial() { if(isDebtViewMode) return alert("Đang xem nợ, không in!"); window.print(); }
+
+
+function downloadInvoiceImage() { 
+    html2canvas(document.getElementById('invoiceArea'), { scale: 2, useCORS: true, allowTaint: true }).then(c => {
+        const l = document.createElement('a'); 
+        l.download = 'HD.png'; 
+        l.href = c.toDataURL(); 
+        l.click();
+    }); 
+}
+
+
+function shareProvisionalImage() { 
+    const n = document.getElementById('invoiceArea'); 
+    n.classList.add('provisional-hidden'); 
+    document.getElementById('lblInvoiceTitle').innerText = "HÓA ĐƠN TẠM TÍNH";
+    
+    html2canvas(n, { scale: 2, useCORS: true, allowTaint: true }).then(c => {
+        c.toBlob(b => {
+            const f = new File([b], "Tam.png", { type: "image/png" }); 
+            if (navigator.share) navigator.share({ files: [f] }); 
+            else {
+                const l = document.createElement('a'); 
+                l.download = 'Tam.png'; 
+                l.href = c.toDataURL(); 
+                l.click();
+            } 
+            n.classList.remove('provisional-hidden'); 
+            document.getElementById('lblInvoiceTitle').innerText = "HÓA ĐƠN BÁN HÀNG"; 
+        });
+    }); 
+}
+
+
+function shareInvoiceImage() { 
+    html2canvas(document.getElementById('invoiceArea'), { scale: 2, useCORS: true, allowTaint: true }).then(c => {
+        c.toBlob(b => {
+            const f = new File([b], "HD.png", { type: "image/png" }); 
+            if (navigator.share) navigator.share({ files: [f] }); 
+            else {
+                const l = document.createElement('a'); 
+                l.download = 'HD.png'; 
+                l.href = c.toDataURL(); 
+                l.click();
+            } 
+        });
+    }); 
+}
+
+
+function deleteCurrentCustomer() {
+    const phone = document.getElementById('crmOriginalPhone').value;
+    const name = document.getElementById('crmNameInput').value;
+    
+    if (!phone) return alert("Không xác định được khách hàng!");
+
+
+    const inputName = prompt(`⚠️ CẢNH BÁO NGUY HIỂM:\n\nBạn đang yêu cầu xóa khách hàng: ${name}\n- Hành động này sẽ xóa VĨNH VIỄN thông tin khách.\n- Xóa TOÀN BỘ lịch sử đơn hàng đã mua.\n- Xóa toàn bộ công nợ và tiền thừa.\n\nĐể xác nhận, vui lòng nhập chính xác tên khách hàng vào ô dưới đây:`);
+
+
+    if (inputName !== name) {
+        alert("❌ Tên nhập không khớp! Hủy bỏ lệnh xóa.");
+        return;
+    }
+
+
+    customerList = customerList.filter(c => c.phone !== phone);
+    localStorage.setItem('thebao_customers', JSON.stringify(customerList));
+
+
+    let history = JSON.parse(localStorage.getItem('invoiceHistory') || "[]");
+    const invoicesToDelete = history.filter(x => x.phone === phone);
+    history = history.filter(x => x.phone !== phone);
+    localStorage.setItem('invoiceHistory', JSON.stringify(history));
+
+
+    let debts = getDebtList();
+    const debtsToDelete = debts.filter(x => x.phone === phone);
+    debts = debts.filter(x => x.phone !== phone);
+    saveDebtList(debts);
+
+
+    let credits = getCredits();
+    if(credits[phone]) {
+        delete credits[phone];
+        localStorage.setItem('thebao_customer_credit', JSON.stringify(credits));
+    }
+
+
+    if (typeof currentUser !== 'undefined' && currentUser) {
+        if(typeof deleteFromCloudCollection === 'function') deleteFromCloudCollection('Customers', phone);
+
+
+        invoicesToDelete.forEach(inv => {
+            if(typeof deleteFromCloudCollection === 'function') deleteFromCloudCollection('Invoices', inv.id);
+        });
+
+
+        debtsToDelete.forEach(d => {
+            if(typeof deleteFromCloudCollection === 'function') deleteFromCloudCollection('Debts', d.id);
+        });
+    }
+
+
+    alert(`✅ Đã xóa hoàn toàn khách hàng ${name} và dữ liệu liên quan!`);
+    closeModal('customerDetailModal'); 
+    renderCustomerTable(); 
+    loadHistory(false); 
+    calculateTodayRevenue(); 
+}
+
+
+// KHỞI ĐỘNG HỆ THỐNG
+initStorageSystem().then(() => {
+    init(); 
+    console.log("✅ App đã khởi động với hệ thống lưu trữ không giới hạn!");
+});
